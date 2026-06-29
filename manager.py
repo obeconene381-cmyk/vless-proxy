@@ -71,7 +71,6 @@ def build_xray_config(users):
         "outbounds": [{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "api"}]
     }
     for email, data in users.items():
-        # لا نتحقق من banned_until بل فقط الرصيد > 0
         if data.get("quota_bytes", 0) > 0:
             config["inbounds"][0]["settings"]["clients"].append({"id": data["uuid"], "email": email})
     os.makedirs(os.path.dirname(XRAY_CONFIG_PATH), exist_ok=True)
@@ -88,7 +87,6 @@ def get_user_traffic():
              "--server=127.0.0.1:10085", "-pattern", "user"],
             stderr=subprocess.STDOUT
         ).decode()
-        # log(f"STATS_RAW: {output}")  # يمكن إلغاء التعليق للتصحيح
         data = json.loads(output)
         traffic = {}
         for item in data.get("stat", []):
@@ -115,11 +113,10 @@ while True:
     time.sleep(20)
     now = time.time()
 
-    # 1. مزامنة المستخدمين (إضافة فقط، لا حظر)
+    # 1. مزامنة المستخدمين
     try:
         users = get_all_users()
         for email, data in users.items():
-            # لا نتحقق من banned_until، فقط الرصيد > 0
             if data.get("quota_bytes", 0) > 0:
                 add_json = {"inboundTag": "vless-inbound", "user": {"id": data["uuid"], "email": email}}
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
@@ -133,10 +130,17 @@ while True:
                     log(f"✅ Added: {email}")
                 else:
                     log(f"❌ Add failed {email}: {result.stderr.decode().strip()}")
+
+                # تشخيص: افحص حالة المستخدم بعد الإضافة
+                check = subprocess.run(
+                    f"/usr/local/bin/xray api inbounduser --server=127.0.0.1:10085 -tag=vless-inbound -email={email}",
+                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                log(f"USER_CHECK: {check.stdout.decode().strip()}")
+
     except Exception as e:
         log(f"❌ Sync error: {e}")
 
-    # 2. حساب الاستهلاك (فرق بين قراءتين)
+    # 2. حساب الاستهلاك
     current_stats = get_user_traffic()
     batch_updates = {}
 
@@ -148,7 +152,7 @@ while True:
         prev = last_stats.get(email, 0)
         used = cur - prev
         if used < 0:
-            used = cur   # إعادة تشغيل Xray
+            used = cur
         if used > 0:
             old = data.get("quota_bytes", 0)
             new = max(old - used, 0)
@@ -157,11 +161,9 @@ while True:
                 batch_updates[email] = data
                 log(f"📉 {email}: -{used} bytes, remaining {new} bytes")
             if new <= 0:
-                # قطع فوري بدون حظر
                 subprocess.run(
                     f"/usr/local/bin/xray api rmu --server=127.0.0.1:10085 -tag=\"vless-inbound\" \"{email}\"",
                     shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                # نزيل أي أثر للحظر (نجعله None)
                 data["banned_until"] = None
                 batch_updates[email] = data
                 log(f"🚫 Quota finished: {email}")
