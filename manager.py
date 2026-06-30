@@ -1,4 +1,4 @@
-import os, time, json, subprocess, tempfile
+import os, time, json, subprocess
 import redis
 
 REDIS_URL = os.environ["REDIS_URL"]
@@ -40,7 +40,7 @@ def save_users_batch(users_dict):
     except Exception as e:
         log(f"❌ Redis save error: {e}")
 
-def build_xray_config(users):
+def restart_xray(users):
     config = {
         "log": {"access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log", "loglevel": "warning"},
         "api": {"tag": "api", "services": ["HandlerService", "StatsService"]},
@@ -77,17 +77,18 @@ def build_xray_config(users):
     with open(XRAY_CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
     subprocess.run(["pkill", "-f", "xray"], stderr=subprocess.DEVNULL)
+    time.sleep(0.3)
     subprocess.Popen(["/usr/local/bin/xray", "run", "-config", XRAY_CONFIG_PATH])
-    log("Xray started with Stats API & User policy.")
+    log("Xray restarted.")
 
 def get_user_traffic():
+    cmd = ["/usr/local/bin/xray", "api", "statsquery", "--server=127.0.0.1:10085", "-pattern", "user"]
     try:
-        output = subprocess.check_output(
-            ["/usr/local/bin/xray", "api", "statsquery",
-             "--server=127.0.0.1:10085", "-pattern", "user"],
-            stderr=subprocess.STDOUT
-        ).decode()
-        data = json.loads(output)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"Statsquery failed (will retry): {result.stderr.strip()}")
+            return None
+        data = json.loads(result.stdout)
         traffic = {}
         for item in data.get("stat", []):
             name = item["name"]
@@ -98,77 +99,81 @@ def get_user_traffic():
                 traffic[email] = traffic.get(email, 0) + value
         return traffic
     except Exception as e:
-        log(f"❌ Statsquery error: {e}")
-        return {}
+        log(f"❌ Statsquery exception: {e}")
+        return None
 
 os.makedirs("/var/log/xray", exist_ok=True)
 open("/var/log/xray/access.log", "a").close()
 users = get_all_users()
-build_xray_config(users)
+restart_xray(users)
+time.sleep(2)
 
-last_stats = get_user_traffic()
-log("Initial stats captured.")
+last_stats = None
+for attempt in range(15):
+    last_stats = get_user_traffic()
+    if last_stats is not None:
+        break
+    time.sleep(1)
+if last_stats is None:
+    last_stats = {}
+log(f"Initial stats: {last_stats}")
+
+last_active = {e for e, d in users.items() if d.get("quota_bytes", 0) > 0}
+last_sync_time = time.time()
+last_quota_check = time.time()
 
 while True:
-    time.sleep(20)
-    now = time.time()
+    if time.time() - last_quota_check >= 3:
+        current_stats = get_user_traffic()
+        if current_stats is not None:
+            batch_updates = {}
+            for email, data in users.items():
+                cur = current_stats.get(email, 0)
+                prev = last_stats.get(email, 0)
+                used = cur - prev
+                if used < 0:
+                    used = cur
+                if used > 0:
+                    old = data.get("quota_bytes", 0)
+                    new = max(old - used, 0)
+                    if new != old:
+                        data["quota_bytes"] = new
+                        batch_updates[email] = data
+                        log(f"📉 {email}: -{used} bytes, remaining {new} bytes")
+                    if new <= 0:
+                        subprocess.run(
+                            f"/usr/local/bin/xray api rmu --server=127.0.0.1:10085 -tag=\"vless-inbound\" \"{email}\"",
+                            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        data["banned_until"] = None
+                        batch_updates[email] = data
+                        log(f"🚫 Quota finished: {email}")
 
-    # 1. مزامنة المستخدمين
-    try:
-        users = get_all_users()
-        for email, data in users.items():
-            if data.get("quota_bytes", 0) > 0:
-                add_json = {"inboundTag": "vless-inbound", "user": {"id": data["uuid"], "email": email}}
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                    json.dump(add_json, f)
-                    tmp_path = f.name
-                result = subprocess.run(
-                    f"/usr/local/bin/xray api adu --server=127.0.0.1:10085 {tmp_path}",
-                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                os.unlink(tmp_path)
-                if result.returncode == 0:
-                    log(f"✅ Added: {email}")
-                else:
-                    log(f"❌ Add failed {email}: {result.stderr.decode().strip()}")
+            if batch_updates:
+                save_users_batch(batch_updates)
 
-                # تشخيص: افحص حالة المستخدم بعد الإضافة
-                check = subprocess.run(
-                    f"/usr/local/bin/xray api inbounduser --server=127.0.0.1:10085 -tag=vless-inbound -email={email}",
-                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                log(f"USER_CHECK: {check.stdout.decode().strip()}")
+            last_stats = current_stats
+        else:
+            log("⚠️ Skipping quota check (statsquery not ready)")
+        
+        last_quota_check = time.time()
 
-    except Exception as e:
-        log(f"❌ Sync error: {e}")
+    if time.time() - last_sync_time >= 20:
+        try:
+            users = get_all_users()
+            current_active = {e for e, d in users.items() if d.get("quota_bytes", 0) > 0}
+            if current_active - last_active:
+                log("New/returned users, restarting Xray...")
+                restart_xray(users)
+                time.sleep(2)
+                for _ in range(15):
+                    new_stats = get_user_traffic()
+                    if new_stats is not None:
+                        last_stats = new_stats
+                        break
+                    time.sleep(1)
+            last_active = current_active
+            last_sync_time = time.time()
+        except Exception as e:
+            log(f"❌ Sync error: {e}")
 
-    # 2. حساب الاستهلاك
-    current_stats = get_user_traffic()
-    batch_updates = {}
-
-    if not current_stats:
-        continue
-
-    for email, data in users.items():
-        cur = current_stats.get(email, 0)
-        prev = last_stats.get(email, 0)
-        used = cur - prev
-        if used < 0:
-            used = cur
-        if used > 0:
-            old = data.get("quota_bytes", 0)
-            new = max(old - used, 0)
-            if new != old:
-                data["quota_bytes"] = new
-                batch_updates[email] = data
-                log(f"📉 {email}: -{used} bytes, remaining {new} bytes")
-            if new <= 0:
-                subprocess.run(
-                    f"/usr/local/bin/xray api rmu --server=127.0.0.1:10085 -tag=\"vless-inbound\" \"{email}\"",
-                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                data["banned_until"] = None
-                batch_updates[email] = data
-                log(f"🚫 Quota finished: {email}")
-
-    if batch_updates:
-        save_users_batch(batch_updates)
-
-    last_stats = current_stats
+    time.sleep(0.5)
