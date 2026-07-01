@@ -59,7 +59,7 @@ def restart_xray(users):
                 "tag": "vless-inbound",
                 "settings": {"clients": [], "decryption": "none"},
                 "streamSettings": {"network": "ws", "security": "none",
-                                   "wsSettings": {"path": "/@nkka404"}}
+                                   "wsSettings": {"path": "/@pycorav1"}}
             },
             {
                 "listen": "127.0.0.1", "port": 10085,
